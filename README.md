@@ -300,10 +300,6 @@ This is especially useful when:
 - Analyzing different ports on the same host
 - Identifying which specific servers need remediation
 
-## Integration with non-destructive_probing3.sh
-
-This tool complements the `non-destructive_probing3.sh` script by providing a standalone way to analyze nmap SSH and TLS scan results. The bash script performs live scanning and validation, while CipherAudit allows you to analyze saved nmap output files, including batch scans with multiple hosts.
-
 ## Troubleshooting
 
 ### "No SSH or TLS algorithms found in nmap output"
