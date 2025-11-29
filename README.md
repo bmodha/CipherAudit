@@ -207,10 +207,6 @@ else
 fi
 ```
 
-## Integration with non-destructive_probing3.sh
-
-This tool complements the `non-destructive_probing3.sh` script by providing a standalone way to analyze nmap SSH scan results. The bash script performs live scanning and validation, while CipherAudit allows you to analyze saved nmap output files.
-
 ## Troubleshooting
 
 ### "No SSH or TLS algorithms found in nmap output"
