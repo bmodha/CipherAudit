@@ -67,24 +67,44 @@ def find_ciphers_file() -> Optional[str]:
     return None
 
 
-def parse_nmap_text(nmap_output: str) -> Dict[str, Dict[str, List[str]]]:
+def parse_nmap_text(nmap_output: str) -> Dict[str, Dict[str, Dict[str, List[str]]]]:
     """
-    Parse nmap text output to extract SSH and TLS algorithms
-    Returns dict with keys: 'ssh' (kex, encryption, mac) and 'tls' (tls1_2, tls1_3)
+    Parse nmap text output to extract SSH and TLS algorithms per host:port
+    Returns dict with keys: 'host:port' -> {'ssh': {...}, 'tls': {...}}
     """
-    algorithms = {
-        'ssh': {
-            'kex': [],
-            'encryption': [],
-            'mac': []
-        },
-        'tls': {
-            'tls1_2': [],
-            'tls1_3': []
-        }
+    # Dictionary to store algorithms per host:port
+    all_algorithms = {}
+    
+    # Current host:port being processed
+    current_host = None
+    current_port = None
+    current_key = None
+    
+    def get_or_create_host_port(host, port):
+        """Get or create algorithm dict for a host:port"""
+        key = f"{host}:{port}"
+        if key not in all_algorithms:
+            all_algorithms[key] = {
+                'ssh': {
+        'kex': [],
+        'encryption': [],
+        'mac': []
+                },
+                'tls': {
+                    'tls1_2': [],
+                    'tls1_3': []
+                }
     }
+        return all_algorithms[key]
     
     current_section = None
+    
+    # Pattern to match "Nmap scan report for" lines
+    # Format: "Nmap scan report for hostname (IP)" or "Nmap scan report for IP"
+    host_pattern = re.compile(r'Nmap scan report for (.+?)(?:\s+\(([^)]+)\))?$')
+    
+    # Pattern to match PORT lines (e.g., "22/tcp open  ssh")
+    port_pattern = re.compile(r'^(\d+)/(tcp|udp)\s+')
     
     # Pattern to match section headers
     section_patterns = {
@@ -101,58 +121,192 @@ def parse_nmap_text(nmap_output: str) -> Dict[str, Dict[str, List[str]]]:
     
     lines = nmap_output.split('\n')
     in_ssh2_enum = False
+    in_ssl_enum = False
     
     for i, line in enumerate(lines):
-        # Check if we're in ssh2-enum-algos section
+        # Check for new host
+        host_match = host_pattern.search(line)
+        if host_match:
+            hostname = host_match.group(1).strip()
+            # Group 2 is the IP in parentheses, if present
+            if host_match.group(2):
+                ip = host_match.group(2).strip()
+            else:
+                # If no IP in parentheses, use hostname (might be IP or hostname)
+                ip = hostname
+            current_host = ip
+            current_port = None
+            current_key = None
+            continue
+        
+        # Check for port line
+        port_match = port_pattern.search(line)
+        if port_match and current_host:
+            current_port = port_match.group(1)
+            current_key = f"{current_host}:{current_port}"
+            get_or_create_host_port(current_host, current_port)
+            continue
+        
+        # Check if we're entering ssh2-enum-algos section
         if 'ssh2-enum-algos' in line:
             in_ssh2_enum = True
-            continue
-        
-        if not in_ssh2_enum:
-            continue
-        
-        # Check for section start
-        for section_name, pattern in section_patterns.items():
-            if pattern.search(line):
-                current_section = section_name
-                continue
-        
-        # Check for section end - stop current section when we hit any other section header
-        if end_pattern.search(line):
             current_section = None
-            # Check if this line starts a new section we care about
+            continue
+        
+        # Check if we're entering ssl-enum-ciphers section
+        if 'ssl-enum-ciphers' in line.lower():
+            in_ssl_enum = True
+            continue
+        
+        # Process SSH algorithms
+        if in_ssh2_enum and current_key:
+            algorithms = all_algorithms[current_key]
+            
+            # Check for section start
             for section_name, pattern in section_patterns.items():
                 if pattern.search(line):
                     current_section = section_name
                     break
-        
-        # Check for end of ssh2-enum-algos section (line starting with |_ or non-pipe line)
-        if line.strip().startswith('|_') or (line.strip() and not line.startswith('|')):
-            # Check if we're still in the ssh2-enum-algos context
-            context_lines = '\n'.join(lines[max(0, i-10):i+1])
-            if 'ssh2-enum-algos' not in context_lines:
-                in_ssh2_enum = False
+            
+            # Check for section end - stop current section when we hit any other section header
+            if end_pattern.search(line):
                 current_section = None
+                # Check if this line starts a new section we care about
+                for section_name, pattern in section_patterns.items():
+                    if pattern.search(line):
+                        current_section = section_name
+                        break
+            
+            # Check for end of ssh2-enum-algos section
+            if line.strip().startswith('|_') or (line.strip() and not line.startswith('|') and 'ssh' not in line.lower()):
+                context_lines = '\n'.join(lines[max(0, i-10):i+1])
+                if 'ssh2-enum-algos' not in context_lines:
+                    in_ssh2_enum = False
+                    current_section = None
+                    continue
+            
+            # Extract algorithm if we're in a section
+            if current_section:
+                match = algo_pattern.match(line)
+                if match:
+                    algo = match.group(1)
+                    if algo not in algorithms['ssh'][current_section]:
+                        algorithms['ssh'][current_section].append(algo)
+        
+        # Process TLS ciphers (will be handled separately, but track host:port)
+        if in_ssl_enum and current_key:
+            # TLS parsing will be done in a separate pass
+            pass
+        
+        # Reset flags when we hit a new host or end of scan
+        if line.strip().startswith('Nmap done') or (line.strip() and not line.startswith('|') and not line.startswith('PORT') and 'scan report' not in line and current_host and i > 0):
+            # Check if we're moving to a new host section
+            if i < len(lines) - 1:
+                next_lines = '\n'.join(lines[i:min(i+5, len(lines))])
+                if 'Nmap scan report' in next_lines:
+                    in_ssh2_enum = False
+                    in_ssl_enum = False
+                    current_section = None
+    
+    # Parse TLS/SSL cipher information from ssl-enum-ciphers script (per host:port)
+    parse_tls_ciphers_text_per_host(nmap_output, all_algorithms)
+    
+    return all_algorithms
+
+
+def parse_tls_ciphers_text_per_host(nmap_output: str, all_algorithms: Dict[str, Dict[str, Dict[str, List[str]]]]):
+    """
+    Parse nmap text output to extract TLS cipher suites from ssl-enum-ciphers script per host:port
+    Updates all_algorithms dict in place
+    """
+    lines = nmap_output.split('\n')
+    in_ssl_enum = False
+    current_tls_version = None
+    current_host = None
+    current_port = None
+    current_key = None
+    
+    # Pattern to match "Nmap scan report for" lines
+    # Format: "Nmap scan report for hostname (IP)" or "Nmap scan report for IP"
+    host_pattern = re.compile(r'Nmap scan report for (.+?)(?:\s+\(([^)]+)\))?$')
+    
+    # Pattern to match PORT lines (e.g., "443/tcp open  ssl/http")
+    port_pattern = re.compile(r'^(\d+)/(tcp|udp)\s+')
+    
+    # Pattern to match TLS version headers
+    tls_version_pattern = re.compile(r'TLSv(1\.\d+)')
+    
+    # Pattern to match cipher suite in various formats
+    cipher_suite_pattern = re.compile(r'(TLS_[A-Z0-9_]+|SSL_[A-Z0-9_]+)', re.IGNORECASE)
+    
+    for i, line in enumerate(lines):
+        # Check for new host
+        host_match = host_pattern.search(line)
+        if host_match:
+            hostname = host_match.group(1).strip()
+            ip = host_match.group(2).strip() if host_match.group(2) else hostname
+            current_host = ip
+            current_port = None
+            current_key = None
+            in_ssl_enum = False
+            current_tls_version = None
+            continue
+        
+        # Check for port line
+        port_match = port_pattern.search(line)
+        if port_match and current_host:
+            current_port = port_match.group(1)
+            current_key = f"{current_host}:{current_port}"
+            in_ssl_enum = False
+            current_tls_version = None
+            continue
+        
+        # Check if we're entering ssl-enum-ciphers section
+        if 'ssl-enum-ciphers' in line.lower():
+            in_ssl_enum = True
+            current_tls_version = None
+            continue
+        
+        if not in_ssl_enum or not current_key:
+            continue
+        
+        # Check for TLS version
+        tls_match = tls_version_pattern.search(line)
+        if tls_match:
+            version = tls_match.group(1)
+            if version == '1.3':
+                current_tls_version = 'tls1_3'
+            elif version == '1.2':
+                current_tls_version = 'tls1_2'
+            elif version in ['1.1', '1.0']:
+                # TLS 1.0/1.1 are deprecated, but we can still track them
+                current_tls_version = 'tls1_2'  # Group with TLS 1.2 for validation
+            continue
+        
+        # Check for end of ssl-enum-ciphers section
+        if line.strip().startswith('|_') or (line.strip() and not line.startswith('|') and 'ssl' not in line.lower() and 'tlsv' not in line.lower()):
+            context_lines = '\n'.join(lines[max(0, i-10):i+1])
+            if 'ssl-enum-ciphers' not in context_lines.lower() and 'tlsv' not in context_lines.lower():
+                in_ssl_enum = False
+                current_tls_version = None
                 continue
         
-        # Extract algorithm if we're in a section
-        if current_section:
-            match = algo_pattern.match(line)
-            if match:
-                algo = match.group(1)
-                if algo not in algorithms['ssh'][current_section]:
-                    algorithms['ssh'][current_section].append(algo)
-    
-    # Parse TLS/SSL cipher information from ssl-enum-ciphers script
-    algorithms['tls'] = parse_tls_ciphers_text(nmap_output)
-    
-    return algorithms
+        # Extract cipher suites
+        if current_tls_version and current_key in all_algorithms:
+            # Look for cipher suite names in the line
+            cipher_matches = cipher_suite_pattern.findall(line)
+            for cipher in cipher_matches:
+                # Normalize cipher name (uppercase)
+                cipher_upper = cipher.upper()
+                if cipher_upper not in all_algorithms[current_key]['tls'][current_tls_version]:
+                    all_algorithms[current_key]['tls'][current_tls_version].append(cipher_upper)
 
 
 def parse_tls_ciphers_text(nmap_output: str) -> Dict[str, List[str]]:
     """
     Parse nmap text output to extract TLS cipher suites from ssl-enum-ciphers script
     Returns dict with keys: tls1_2, tls1_3
+    (Legacy function for backward compatibility)
     """
     tls_ciphers = {
         'tls1_2': [],
@@ -163,18 +317,10 @@ def parse_tls_ciphers_text(nmap_output: str) -> Dict[str, List[str]]:
     in_ssl_enum = False
     current_tls_version = None
     
-    # Pattern to detect ssl-enum-ciphers section
-    ssl_enum_pattern = re.compile(r'ssl-enum-ciphers|TLSv\d+\.\d+')
-    
     # Pattern to match TLS version headers
     tls_version_pattern = re.compile(r'TLSv(1\.\d+)')
     
-    # Pattern to match cipher suite lines (typically indented)
-    # Format can vary: "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" or similar
-    cipher_pattern = re.compile(r'^\s+(TLS_[A-Z0-9_]+|SSL_[A-Z0-9_]+)', re.IGNORECASE)
-    
     # Pattern to match cipher suite in various formats
-    # Could be: "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" or "0x00,0x3D" format
     cipher_suite_pattern = re.compile(r'(TLS_[A-Z0-9_]+|SSL_[A-Z0-9_]+)', re.IGNORECASE)
     
     for i, line in enumerate(lines):
@@ -195,8 +341,7 @@ def parse_tls_ciphers_text(nmap_output: str) -> Dict[str, List[str]]:
             elif version == '1.2':
                 current_tls_version = 'tls1_2'
             elif version in ['1.1', '1.0']:
-                # TLS 1.0/1.1 are deprecated, but we can still track them
-                current_tls_version = 'tls1_2'  # Group with TLS 1.2 for validation
+                current_tls_version = 'tls1_2'
             continue
         
         # Check for end of ssl-enum-ciphers section
@@ -209,10 +354,8 @@ def parse_tls_ciphers_text(nmap_output: str) -> Dict[str, List[str]]:
         
         # Extract cipher suites
         if current_tls_version:
-            # Look for cipher suite names in the line
             cipher_matches = cipher_suite_pattern.findall(line)
             for cipher in cipher_matches:
-                # Normalize cipher name (uppercase)
                 cipher_upper = cipher.upper()
                 if cipher_upper not in tls_ciphers[current_tls_version]:
                     tls_ciphers[current_tls_version].append(cipher_upper)
@@ -283,66 +426,108 @@ def parse_tls_ciphers_xml(script_element) -> Dict[str, List[str]]:
     return tls_ciphers
 
 
-def parse_nmap_xml(nmap_xml: str) -> Dict[str, Dict[str, List[str]]]:
+def parse_nmap_xml(nmap_xml: str) -> Dict[str, Dict[str, Dict[str, List[str]]]]:
     """
-    Parse nmap XML output to extract SSH and TLS algorithms
-    Returns dict with keys: 'ssh' (kex, encryption, mac) and 'tls' (tls1_2, tls1_3)
+    Parse nmap XML output to extract SSH and TLS algorithms per host:port
+    Returns dict with keys: 'host:port' -> {'ssh': {...}, 'tls': {...}}
     """
     try:
         import xml.etree.ElementTree as ET
     except ImportError:
         print("Error: XML parsing requires xml.etree.ElementTree", file=sys.stderr)
-        return {
-            'ssh': {'kex': [], 'encryption': [], 'mac': []},
-            'tls': {'tls1_2': [], 'tls1_3': []}
-        }
+        return {}
     
-    algorithms = {
-        'ssh': {
-            'kex': [],
-            'encryption': [],
-            'mac': []
-        },
-        'tls': {
-            'tls1_2': [],
-            'tls1_3': []
-        }
-    }
+    all_algorithms = {}
+    
+    def get_or_create_host_port(host, port):
+        """Get or create algorithm dict for a host:port"""
+        key = f"{host}:{port}"
+        if key not in all_algorithms:
+            all_algorithms[key] = {
+                'ssh': {
+                    'kex': [],
+                    'encryption': [],
+                    'mac': []
+                },
+                'tls': {
+                    'tls1_2': [],
+                    'tls1_3': []
+                }
+            }
+        return all_algorithms[key]
     
     try:
         root = ET.fromstring(nmap_xml)
         
-        # Find ssh2-enum-algos script output
+        # Iterate through all hosts and ports
         for host in root.findall('.//host'):
+            # Get host address (prefer IPv4, fallback to IPv6 or hostname)
+            host_addr = None
+            for address in host.findall('.//address'):
+                if address.get('addrtype') == 'ipv4':
+                    host_addr = address.get('addr')
+                    break
+            if not host_addr:
+                for address in host.findall('.//address'):
+                    host_addr = address.get('addr')
+                    break
+            
+            if not host_addr:
+                continue
+            
+            # Process each port
             for port in host.findall('.//port'):
+                port_num = port.get('portid')
+                if not port_num:
+                    continue
+                
+                key = f"{host_addr}:{port_num}"
+                algorithms = get_or_create_host_port(host_addr, port_num)
+                
+                # Process scripts for this port
                 for script in port.findall('.//script'):
-                    if script.get('id') == 'ssh2-enum-algos':
+                    script_id = script.get('id')
+                    
+                    # Process SSH algorithms
+                    if script_id == 'ssh2-enum-algos':
                         # First try to get algorithms from table elements (structured data)
                         for table in script.findall('.//table'):
-                            key = table.get('key', '')
-                            if key == 'kex_algorithms':
+                            table_key = table.get('key', '')
+                            if table_key == 'kex_algorithms':
                                 for elem in table.findall('.//elem'):
                                     algo = elem.text
                                     if algo and algo not in algorithms['ssh']['kex']:
                                         algorithms['ssh']['kex'].append(algo)
-                            elif key == 'encryption_algorithms':
+                            elif table_key == 'encryption_algorithms':
                                 for elem in table.findall('.//elem'):
                                     algo = elem.text
                                     if algo and algo not in algorithms['ssh']['encryption']:
                                         algorithms['ssh']['encryption'].append(algo)
-                            elif key == 'mac_algorithms':
+                            elif table_key == 'mac_algorithms':
                                 for elem in table.findall('.//elem'):
                                     algo = elem.text
                                     if algo and algo not in algorithms['ssh']['mac']:
                                         algorithms['ssh']['mac'].append(algo)
+                        
+                        # Fallback: parse output text if tables weren't found
+                        if not any(algorithms['ssh'].values()):
+                            output = script.get('output', '')
+                            import html
+                            output = html.unescape(output)
+                            # Use a simple text parsing approach for fallback
+                            for line in output.split('\n'):
+                                if 'kex_algorithms' in line or 'encryption_algorithms' in line or 'mac_algorithms' in line:
+                                    # Try to extract from output text
+                                    pass
                     
-                    # Parse TLS/SSL ciphers from ssl-enum-ciphers script
-                    elif script.get('id') == 'ssl-enum-ciphers':
+                    # Process TLS/SSL ciphers
+                    elif script_id == 'ssl-enum-ciphers':
                         # Parse TLS cipher information from XML
                         tls_info = parse_tls_ciphers_xml(script)
                         for version in ['tls1_2', 'tls1_3']:
-                            algorithms['tls'][version].extend(tls_info.get(version, []))
-                            algorithms['tls'][version] = list(set(algorithms['tls'][version]))
+                            for cipher in tls_info.get(version, []):
+                                if cipher not in algorithms['tls'][version]:
+                                    algorithms['tls'][version].append(cipher)
                         
                         # Fallback: parse output text if structured data not found
                         if not any(algorithms['tls'].values()):
@@ -351,56 +536,23 @@ def parse_nmap_xml(nmap_xml: str) -> Dict[str, Dict[str, List[str]]]:
                             output = html.unescape(output)
                             parsed_tls = parse_tls_ciphers_text(output)
                             for version in ['tls1_2', 'tls1_3']:
-                                algorithms['tls'][version].extend(parsed_tls.get(version, []))
-                                algorithms['tls'][version] = list(set(algorithms['tls'][version]))
-                        
-                        # Fallback for SSH: parse the output text if tables weren't found
-                        if not any(algorithms['ssh'].values()):
-                            output = script.get('output', '')
-                            import html
-                            output = html.unescape(output)
-                            parsed = parse_nmap_text(output)
-                            if 'ssh' in parsed:
-                                for key in ['kex', 'encryption', 'mac']:
-                                    algorithms['ssh'][key].extend(parsed['ssh'].get(key, []))
-                                    algorithms['ssh'][key] = list(set(algorithms['ssh'][key]))
-        
-        # Parse TLS ciphers from all scripts (in case they're in different ports)
-        for host in root.findall('.//host'):
-            for port in host.findall('.//port'):
-                for script in port.findall('.//script'):
-                    if script.get('id') == 'ssl-enum-ciphers':
-                        tls_info = parse_tls_ciphers_xml(script)
-                        for version in ['tls1_2', 'tls1_3']:
-                            algorithms['tls'][version].extend(tls_info.get(version, []))
-                            algorithms['tls'][version] = list(set(algorithms['tls'][version]))
+                                for cipher in parsed_tls.get(version, []):
+                                    if cipher not in algorithms['tls'][version]:
+                                        algorithms['tls'][version].append(cipher)
         
     except ET.ParseError as e:
         print(f"Error parsing XML: {e}", file=sys.stderr)
-        return {
-            'ssh': {'kex': [], 'encryption': [], 'mac': []},
-            'tls': {'tls1_2': [], 'tls1_3': []}
-        }
+        return {}
     
-    return algorithms
+    return all_algorithms
 
 
-def validate_algorithms(algorithms: Dict[str, Dict[str, List[str]]], ciphers_data: Dict) -> Dict[str, Dict[str, Dict[str, List[str]]]]:
+def validate_algorithms(algorithms: Dict[str, Dict[str, Dict[str, List[str]]]], ciphers_data: Dict) -> Dict[str, Dict[str, Dict[str, Dict[str, List[str]]]]]:
     """
-    Validate algorithms against ciphers.json
-    Returns dict with 'ssh' and 'tls' sections, each containing 'allowed' and 'violations' for each algorithm type
+    Validate algorithms against ciphers.json per host:port
+    Returns dict with keys: 'host:port' -> {'ssh': {...}, 'tls': {...}} with allowed/violations
     """
-    results = {
-        'ssh': {
-            'kex': {'allowed': [], 'violations': []},
-            'encryption': {'allowed': [], 'violations': []},
-            'mac': {'allowed': [], 'violations': []}
-        },
-        'tls': {
-            'tls1_2': {'allowed': [], 'violations': []},
-            'tls1_3': {'allowed': [], 'violations': []}
-        }
-    }
+    results = {}
     
     # Validate SSH algorithms
     ssh_allowed = ciphers_data.get('ssh', {})
@@ -410,35 +562,50 @@ def validate_algorithms(algorithms: Dict[str, Dict[str, List[str]]], ciphers_dat
         'mac': 'macs'
     }
     
-    for algo_type, algo_list in algorithms.get('ssh', {}).items():
-        ciphers_key = ciphers_map[algo_type]
-        allowed_list = ssh_allowed.get(ciphers_key, [])
-        
-        for algo in algo_list:
-            if algo in allowed_list:
-                results['ssh'][algo_type]['allowed'].append(algo)
-            else:
-                results['ssh'][algo_type]['violations'].append(algo)
-    
     # Validate TLS ciphers
     ssl_allowed = ciphers_data.get('ssl', {})
     
-    for tls_version in ['tls1_2', 'tls1_3']:
-        cipher_list = algorithms.get('tls', {}).get(tls_version, [])
-        # Map tls1_2 -> tls1_2, tls1_3 -> tls1_3 in ciphers.json
-        allowed_list = ssl_allowed.get(tls_version, [])
+    # Process each host:port
+    for host_port, algo_data in algorithms.items():
+        results[host_port] = {
+            'ssh': {
+                'kex': {'allowed': [], 'violations': []},
+                'encryption': {'allowed': [], 'violations': []},
+                'mac': {'allowed': [], 'violations': []}
+            },
+            'tls': {
+                'tls1_2': {'allowed': [], 'violations': []},
+                'tls1_3': {'allowed': [], 'violations': []}
+            }
+        }
         
-        for cipher in cipher_list:
-            if cipher in allowed_list:
-                results['tls'][tls_version]['allowed'].append(cipher)
-            else:
-                results['tls'][tls_version]['violations'].append(cipher)
+        # Validate SSH algorithms for this host:port
+        for algo_type, algo_list in algo_data.get('ssh', {}).items():
+            ciphers_key = ciphers_map[algo_type]
+            allowed_list = ssh_allowed.get(ciphers_key, [])
+            
+            for algo in algo_list:
+                if algo in allowed_list:
+                    results[host_port]['ssh'][algo_type]['allowed'].append(algo)
+                else:
+                    results[host_port]['ssh'][algo_type]['violations'].append(algo)
+        
+        # Validate TLS ciphers for this host:port
+        for tls_version in ['tls1_2', 'tls1_3']:
+            cipher_list = algo_data.get('tls', {}).get(tls_version, [])
+            allowed_list = ssl_allowed.get(tls_version, [])
+            
+            for cipher in cipher_list:
+                if cipher in allowed_list:
+                    results[host_port]['tls'][tls_version]['allowed'].append(cipher)
+                else:
+                    results[host_port]['tls'][tls_version]['violations'].append(cipher)
     
     return results
 
 
-def print_results(results: Dict[str, Dict[str, Dict[str, List[str]]]], ciphers_file: Optional[str]):
-    """Print validation results in a formatted way"""
+def print_results(results: Dict[str, Dict[str, Dict[str, Dict[str, List[str]]]]], ciphers_file: Optional[str]):
+    """Print validation results grouped by host:port"""
     print(f"\n{Colors.CYAN}{Colors.BOLD}Algorithm Validation (ciphers.json = allowed list):{Colors.RESET}")
     if ciphers_file:
         print(f"Using ciphers.json: {ciphers_file}\n")
@@ -446,65 +613,83 @@ def print_results(results: Dict[str, Dict[str, Dict[str, List[str]]]], ciphers_f
         print(f"{Colors.YELLOW}Warning: ciphers.json not found - showing all algorithms as violations{Colors.RESET}\n")
     
     total_violations = 0
+    total_hosts = len(results)
     
-    # Process SSH results
-    ssh_results = results.get('ssh', {})
-    if any(ssh_results.values()):
-        print(f"{Colors.BOLD}SSH Algorithms:{Colors.RESET}\n")
+    # Process each host:port
+    for host_port, host_results in sorted(results.items()):
+        host_violations = 0
         
-        for algo_type in ['kex', 'encryption', 'mac']:
-            type_name = algo_type.capitalize()
-            if algo_type == 'kex':
-                type_name = 'KEX'
-            elif algo_type == 'encryption':
-                type_name = 'Encryption Ciphers'
-            elif algo_type == 'mac':
-                type_name = 'MAC Algorithms'
-            
-            violations = ssh_results.get(algo_type, {}).get('violations', [])
-            allowed = ssh_results.get(algo_type, {}).get('allowed', [])
-            
-            if violations:
-                total_violations += len(violations)
-                print(f"{Colors.RED}⚠ VIOLATIONS - {type_name} (NOT in allowed list):{Colors.RESET}")
-                for algo in sorted(violations):
-                    print(f"    {Colors.RED}✗{Colors.RESET} {algo} {Colors.RED}(VIOLATION - not in allowed list){Colors.RESET}")
-                print()
-            
-            if allowed:
-                print(f"Allowed {type_name}:")
-                for algo in sorted(allowed):
-                    print(f"    {Colors.GREEN}✓{Colors.RESET} {algo} (allowed)")
-                print()
-    
-    # Process TLS results
-    tls_results = results.get('tls', {})
-    if any(tls_results.values()):
-        print(f"{Colors.BOLD}TLS/SSL Ciphers:{Colors.RESET}\n")
+        print(f"{Colors.BOLD}{'='*70}{Colors.RESET}")
+        print(f"{Colors.BOLD}Host:Port: {Colors.CYAN}{host_port}{Colors.RESET}")
+        print(f"{Colors.BOLD}{'='*70}{Colors.RESET}\n")
         
-        for tls_version in ['tls1_2', 'tls1_3']:
-            version_name = f"TLS {tls_version.replace('tls', '').replace('_', '.')}"
-            violations = tls_results.get(tls_version, {}).get('violations', [])
-            allowed = tls_results.get(tls_version, {}).get('allowed', [])
+        # Process SSH results for this host:port
+        ssh_results = host_results.get('ssh', {})
+        if any(ssh_results.values()):
+            print(f"{Colors.BOLD}SSH Algorithms:{Colors.RESET}\n")
             
-            if violations:
-                total_violations += len(violations)
-                print(f"{Colors.RED}⚠ VIOLATIONS - {version_name} Ciphers (NOT in allowed list):{Colors.RESET}")
-                for cipher in sorted(violations):
-                    print(f"    {Colors.RED}✗{Colors.RESET} {cipher} {Colors.RED}(VIOLATION - not in allowed list){Colors.RESET}")
-                print()
+            for algo_type in ['kex', 'encryption', 'mac']:
+                type_name = algo_type.capitalize()
+                if algo_type == 'kex':
+                    type_name = 'KEX'
+                elif algo_type == 'encryption':
+                    type_name = 'Encryption Ciphers'
+                elif algo_type == 'mac':
+                    type_name = 'MAC Algorithms'
+                
+                violations = ssh_results.get(algo_type, {}).get('violations', [])
+                allowed = ssh_results.get(algo_type, {}).get('allowed', [])
+                
+                if violations:
+                    host_violations += len(violations)
+                    total_violations += len(violations)
+                    print(f"{Colors.RED}⚠ VIOLATIONS - {type_name} (NOT in allowed list):{Colors.RESET}")
+                    for algo in sorted(violations):
+                        print(f"    {Colors.RED}✗{Colors.RESET} {algo} {Colors.RED}(VIOLATION - not in allowed list){Colors.RESET}")
+                    print()
+                
+                if allowed:
+                    print(f"Allowed {type_name}:")
+                    for algo in sorted(allowed):
+                        print(f"    {Colors.GREEN}✓{Colors.RESET} {algo} (allowed)")
+                    print()
+        
+        # Process TLS results for this host:port
+        tls_results = host_results.get('tls', {})
+        if any(tls_results.values()):
+            print(f"{Colors.BOLD}TLS/SSL Ciphers:{Colors.RESET}\n")
             
-            if allowed:
-                print(f"Allowed {version_name} Ciphers:")
-                for cipher in sorted(allowed):
-                    print(f"    {Colors.GREEN}✓{Colors.RESET} {cipher} (allowed)")
-                print()
+            for tls_version in ['tls1_2', 'tls1_3']:
+                version_name = f"TLS {tls_version.replace('tls', '').replace('_', '.')}"
+                violations = tls_results.get(tls_version, {}).get('violations', [])
+                allowed = tls_results.get(tls_version, {}).get('allowed', [])
+                
+                if violations:
+                    host_violations += len(violations)
+                    total_violations += len(violations)
+                    print(f"{Colors.RED}⚠ VIOLATIONS - {version_name} Ciphers (NOT in allowed list):{Colors.RESET}")
+                    for cipher in sorted(violations):
+                        print(f"    {Colors.RED}✗{Colors.RESET} {cipher} {Colors.RED}(VIOLATION - not in allowed list){Colors.RESET}")
+                    print()
+                
+                if allowed:
+                    print(f"Allowed {version_name} Ciphers:")
+                    for cipher in sorted(allowed):
+                        print(f"    {Colors.GREEN}✓{Colors.RESET} {cipher} (allowed)")
+                    print()
+        
+        # Summary for this host:port
+        if host_violations > 0:
+            print(f"{Colors.RED}⚠ {host_port}: {host_violations} violation(s) found{Colors.RESET}\n")
+        else:
+            print(f"{Colors.GREEN}✓ {host_port}: No violations - all algorithms are in allowed list{Colors.RESET}\n")
     
-    # Summary
+    # Overall summary
+    print(f"{Colors.BOLD}{'='*70}{Colors.RESET}")
     if total_violations > 0:
-        print(f"{Colors.RED}⚠ Total Violations: {total_violations} algorithm(s) not in allowed list{Colors.RESET}\n")
+        print(f"{Colors.RED}⚠ Overall Summary: {total_violations} violation(s) across {total_hosts} host(s){Colors.RESET}\n")
     else:
-        print(f"{Colors.GREEN}✓ No violations - all algorithms are in allowed list{Colors.RESET}\n")
+        print(f"{Colors.GREEN}✓ Overall Summary: No violations found across {total_hosts} host(s){Colors.RESET}\n")
 
 
 def main():
@@ -542,7 +727,10 @@ Examples:
     
     if not ciphers_file:
         print(f"{Colors.YELLOW}Warning: ciphers.json not found. Will show all algorithms as violations.{Colors.RESET}", file=sys.stderr)
-        ciphers_data = {'ssh': {'kex': [], 'ciphers': [], 'macs': []}}
+        ciphers_data = {
+            'ssh': {'kex': [], 'ciphers': [], 'macs': []},
+            'ssl': {'tls1_2': [], 'tls1_3': []}
+        }
     else:
         ciphers_data = load_ciphers_json(ciphers_file)
         if not ciphers_data:
@@ -595,9 +783,11 @@ Examples:
         algorithms = parse_nmap_text(nmap_output)
     
     # Check if we found any algorithms
-    ssh_algos = sum(len(v) for v in algorithms.get('ssh', {}).values())
-    tls_algos = sum(len(v) for v in algorithms.get('tls', {}).values())
-    total_algos = ssh_algos + tls_algos
+    total_algos = 0
+    for host_port, algo_data in algorithms.items():
+        ssh_algos = sum(len(v) for v in algo_data.get('ssh', {}).values())
+        tls_algos = sum(len(v) for v in algo_data.get('tls', {}).values())
+        total_algos += ssh_algos + tls_algos
     
     if total_algos == 0:
         print(f"{Colors.YELLOW}Warning: No SSH or TLS algorithms found in nmap output.{Colors.RESET}", file=sys.stderr)
@@ -613,9 +803,10 @@ Examples:
     
     # Exit with error code if violations found
     total_violations = 0
-    for protocol in results.values():
-        for algo_type in protocol.values():
-            total_violations += len(algo_type.get('violations', []))
+    for host_port, host_results in results.items():
+        for protocol in host_results.values():
+            for algo_type in protocol.values():
+                total_violations += len(algo_type.get('violations', []))
     
     if total_violations > 0:
         sys.exit(1)
