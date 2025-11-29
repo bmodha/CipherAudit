@@ -10,11 +10,13 @@ CipherAudit parses nmap SSH and TLS/SSL scan results and compares the discovered
 
 - **Parses nmap output**: Supports both text and XML nmap output formats
 - **Multi-protocol support**: Validates both SSH and TLS/SSL algorithms
+- **Per-host:port breakdown**: Groups results by host and port for easy identification of problematic servers
 - **Algorithm validation**: Compares discovered algorithms against an allowed list
 - **Violation detection**: Highlights algorithms that are NOT in the allowed list
 - **Color-coded output**: Red for violations, green for allowed algorithms
 - **Multiple input methods**: File input, stdin, or pipe from nmap
 - **Auto-detection**: Automatically detects XML vs text format
+- **Multi-host support**: Processes multiple IPs and ports from a single nmap scan file
 
 ## Requirements
 
@@ -99,17 +101,25 @@ Example structure:
 
 ## Output Format
 
-The tool provides a color-coded report showing:
+The tool provides a color-coded report grouped by host:port, showing:
 
-1. **Violations** (in red): Algorithms found that are NOT in the allowed list
-2. **Allowed algorithms** (in green): Algorithms found that ARE in the allowed list
-3. **Summary**: Total count of violations
+1. **Per-host:port sections**: Each host:port combination is displayed separately
+2. **Violations** (in red): Algorithms found that are NOT in the allowed list
+3. **Allowed algorithms** (in green): Algorithms found that ARE in the allowed list
+4. **Per-host summary**: Violation count for each host:port
+5. **Overall summary**: Total violations across all hosts
 
 Example output:
 
 ```
 Algorithm Validation (ciphers.json = allowed list):
 Using ciphers.json: /path/to/ciphers.json
+
+======================================================================
+Host:Port: 192.168.1.100:22
+======================================================================
+
+SSH Algorithms:
 
 ⚠ VIOLATIONS - KEX (NOT in allowed list):
     ✗ diffie-hellman-group14-sha1 (VIOLATION - not in allowed list)
@@ -119,8 +129,27 @@ Allowed KEX:
     ✓ curve25519-sha256 (allowed)
     ✓ ecdh-sha2-nistp384 (allowed)
 
-⚠ Total Violations: 2 algorithm(s) not in allowed list
+⚠ 192.168.1.100:22: 2 violation(s) found
+
+======================================================================
+Host:Port: 192.168.1.100:443
+======================================================================
+
+TLS/SSL Ciphers:
+
+⚠ VIOLATIONS - TLS 1.2 Ciphers (NOT in allowed list):
+    ✗ TLS_RSA_WITH_AES_256_CBC_SHA (VIOLATION - not in allowed list)
+
+Allowed TLS 1.2 Ciphers:
+    ✓ TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 (allowed)
+
+⚠ 192.168.1.100:443: 1 violation(s) found
+
+======================================================================
+⚠ Overall Summary: 3 violation(s) across 2 host(s)
 ```
+
+**Note**: When processing multiple hosts and ports, each host:port combination is analyzed separately, making it easy to identify which specific servers need attention.
 
 ## Nmap Scan Requirements
 
@@ -154,6 +183,20 @@ You can analyze both SSH and TLS in a single scan by combining the scripts:
 nmap -p 22,443 --script=ssh2-enum-algos,ssl-enum-ciphers target
 ```
 
+### Multiple Hosts Analysis
+
+The tool automatically processes multiple hosts and ports from a single nmap scan file. Each host:port combination is analyzed and reported separately:
+
+```bash
+# Scan multiple hosts
+nmap -p 22,443 --script=ssh2-enum-algos,ssl-enum-ciphers 192.168.1.100 192.168.1.101 192.168.1.102 -oN scan.txt
+
+# Analyze all results
+python3 cipheraudit.py scan.txt
+```
+
+The output will show results grouped by each `host:port` combination, making it easy to identify which specific servers have violations.
+
 ## Exit Codes
 
 - `0`: No violations found (all algorithms are in allowed list)
@@ -184,7 +227,24 @@ nmap -p 22,443 --script=ssh2-enum-algos,ssl-enum-ciphers 192.168.1.100 -oN scan.
 python3 cipheraudit.py scan.txt
 ```
 
-### Example 4: Analyze multiple hosts from a file
+### Example 4: Analyze multiple hosts in a single scan
+
+```bash
+# Scan multiple hosts at once
+nmap -p 22,443 --script=ssh2-enum-algos,ssl-enum-ciphers 192.168.1.100 192.168.1.101 192.168.1.102 -oN multi-host-scan.txt
+
+# Analyze all results - each host:port will be shown separately
+python3 cipheraudit.py multi-host-scan.txt
+```
+
+This will show results for each host:port combination:
+- `192.168.1.100:22` (SSH)
+- `192.168.1.100:443` (TLS/SSL)
+- `192.168.1.101:22` (SSH)
+- `192.168.1.101:443` (TLS/SSL)
+- etc.
+
+### Example 5: Analyze multiple hosts from a file (individual scans)
 
 ```bash
 for host in $(cat hosts.txt); do
@@ -194,7 +254,7 @@ for host in $(cat hosts.txt); do
 done
 ```
 
-### Example 5: Use in a script with exit code checking
+### Example 6: Use in a script with exit code checking
 
 ```bash
 #!/bin/bash
@@ -206,6 +266,43 @@ else
   exit 1
 fi
 ```
+
+### Example 7: Batch scan with per-host reporting
+
+```bash
+#!/bin/bash
+# Scan multiple hosts
+hosts="192.168.1.100 192.168.1.101 192.168.1.102"
+nmap -p 22,443 --script=ssh2-enum-algos,ssl-enum-ciphers $hosts -oN batch-scan.txt
+
+# Analyze - results will show per host:port
+python3 cipheraudit.py batch-scan.txt
+
+# Exit code reflects overall violations across all hosts
+if [ $? -eq 0 ]; then
+  echo "All hosts are compliant"
+else
+  echo "Some hosts have violations - check output above"
+fi
+```
+
+## Per-Host:Port Reporting
+
+CipherAudit automatically groups results by `host:port` combination, making it easy to identify which specific servers have violations. When processing multiple hosts or ports:
+
+- Each `host:port` is analyzed separately
+- Violations are clearly attributed to specific servers
+- Per-host summaries show violation counts for each server
+- Overall summary provides total violations across all hosts
+
+This is especially useful when:
+- Scanning multiple servers in a network
+- Analyzing different ports on the same host
+- Identifying which specific servers need remediation
+
+## Integration with non-destructive_probing3.sh
+
+This tool complements the `non-destructive_probing3.sh` script by providing a standalone way to analyze nmap SSH and TLS scan results. The bash script performs live scanning and validation, while CipherAudit allows you to analyze saved nmap output files, including batch scans with multiple hosts.
 
 ## Troubleshooting
 
