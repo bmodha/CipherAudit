@@ -319,9 +319,6 @@ This is especially useful when:
 - Use `--no-color` flag if your terminal doesn't support colors
 - Colors are automatically disabled when output is piped to a file
 
-## License
-
-This tool is part of the Pentest-visualizer project.
 
 ## Contributing
 
