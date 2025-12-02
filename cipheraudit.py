@@ -17,6 +17,12 @@ import argparse
 from pathlib import Path
 from typing import Dict, List, Set, Optional, Tuple
 
+try:
+    from tabulate import tabulate
+    TABULATE_AVAILABLE = True
+except ImportError:
+    TABULATE_AVAILABLE = False
+
 
 class Colors:
     """ANSI color codes"""
@@ -86,15 +92,16 @@ def parse_nmap_text(nmap_output: str) -> Dict[str, Dict[str, Dict[str, List[str]
         if key not in all_algorithms:
             all_algorithms[key] = {
                 'ssh': {
-        'kex': [],
-        'encryption': [],
-        'mac': []
+                    'kex': [],
+                    'encryption': [],
+                    'mac': [],
+                    'host_keys': []
                 },
                 'tls': {
                     'tls1_2': [],
                     'tls1_3': []
                 }
-    }
+            }
         return all_algorithms[key]
     
     current_section = None
@@ -110,7 +117,8 @@ def parse_nmap_text(nmap_output: str) -> Dict[str, Dict[str, Dict[str, List[str]
     section_patterns = {
         'kex': re.compile(r'kex_algorithms:\s*\(\d+\)'),
         'encryption': re.compile(r'encryption_algorithms:\s*\(\d+\)'),
-        'mac': re.compile(r'mac_algorithms:\s*\(\d+\)')
+        'mac': re.compile(r'mac_algorithms:\s*\(\d+\)'),
+        'host_keys': re.compile(r'server_host_key_algorithms:\s*\(\d+\)')
     }
     
     # Pattern to match algorithm lines (indented with 7 spaces after pipe: "|       algorithm")
@@ -447,7 +455,8 @@ def parse_nmap_xml(nmap_xml: str) -> Dict[str, Dict[str, Dict[str, List[str]]]]:
                 'ssh': {
                     'kex': [],
                     'encryption': [],
-                    'mac': []
+                    'mac': [],
+                    'host_keys': []
                 },
                 'tls': {
                     'tls1_2': [],
@@ -508,6 +517,11 @@ def parse_nmap_xml(nmap_xml: str) -> Dict[str, Dict[str, Dict[str, List[str]]]]:
                                     algo = elem.text
                                     if algo and algo not in algorithms['ssh']['mac']:
                                         algorithms['ssh']['mac'].append(algo)
+                            elif table_key == 'server_host_key_algorithms':
+                                for elem in table.findall('.//elem'):
+                                    algo = elem.text
+                                    if algo and algo not in algorithms['ssh']['host_keys']:
+                                        algorithms['ssh']['host_keys'].append(algo)
                         
                         # Fallback: parse output text if tables weren't found
                         if not any(algorithms['ssh'].values()):
@@ -559,7 +573,8 @@ def validate_algorithms(algorithms: Dict[str, Dict[str, Dict[str, List[str]]]], 
     ciphers_map = {
         'kex': 'kex',
         'encryption': 'ciphers',
-        'mac': 'macs'
+        'mac': 'macs',
+        'host_keys': 'host_keys'
     }
     
     # Validate TLS ciphers
@@ -571,7 +586,8 @@ def validate_algorithms(algorithms: Dict[str, Dict[str, Dict[str, List[str]]]], 
             'ssh': {
                 'kex': {'allowed': [], 'violations': []},
                 'encryption': {'allowed': [], 'violations': []},
-                'mac': {'allowed': [], 'violations': []}
+                'mac': {'allowed': [], 'violations': []},
+                'host_keys': {'allowed': [], 'violations': []}
             },
             'tls': {
                 'tls1_2': {'allowed': [], 'violations': []},
@@ -581,8 +597,15 @@ def validate_algorithms(algorithms: Dict[str, Dict[str, Dict[str, List[str]]]], 
         
         # Validate SSH algorithms for this host:port
         for algo_type, algo_list in algo_data.get('ssh', {}).items():
+            # Skip if this algo_type is not in our mapping
+            if algo_type not in ciphers_map:
+                continue
             ciphers_key = ciphers_map[algo_type]
             allowed_list = ssh_allowed.get(ciphers_key, [])
+            
+            # Make sure results structure has this algo_type
+            if algo_type not in results[host_port]['ssh']:
+                results[host_port]['ssh'][algo_type] = {'allowed': [], 'violations': []}
             
             for algo in algo_list:
                 if algo in allowed_list:
@@ -604,13 +627,174 @@ def validate_algorithms(algorithms: Dict[str, Dict[str, Dict[str, List[str]]]], 
     return results
 
 
+def print_logo():
+    """Print CIPHERAUDIT logo"""
+    logo = f"""
+{Colors.CYAN}{Colors.BOLD}
+╔═══════════════════════════════════════════════════════════╗
+║                                                           ║
+║     ██████╗██╗██████╗ ██╗  ██╗███████╗██████╗             ║
+║    ██╔════╝██║██╔══██╗██║  ██║██╔════╝██╔══██╗            ║
+║    ██║     ██║██████╔╝███████║█████╗  ██████╔╝            ║
+║    ██║     ██║██╔══██╗██╔══██║██╔══╝  ██╔══██╗            ║
+║    ╚██████╗██║██████╔╝██║  ██║███████╗██║  ██║            ║
+║     ╚═════╝╚═╝╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝            ║
+║                                                           ║
+║     █████╗ ██╗   ██╗██████╗ ██╗████████╗                 ║
+║    ██╔══██╗██║   ██║██╔══██╗██║╚══██╔══╝                 ║
+║    ███████║██║   ██║██║  ██║██║   ██║                    ║
+║    ██╔══██║██║   ██║██║  ██║██║   ██║                    ║
+║    ██║  ██║╚██████╔╝██████╔╝██║   ██║                    ║
+║    ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝   ╚═╝                    ║
+║                                                           ║
+╚═══════════════════════════════════════════════════════════╝
+{Colors.RESET}
+"""
+    print(logo)
+
+
+def print_table(title: str, algorithms: List[str], allowed: List[str], violations: List[str], max_width: int = 80):
+    """
+    Print a table with Algorithm | Allowed | Not Allowed columns using tabulate
+    
+    Args:
+        title: Table title
+        algorithms: Combined list of all algorithms (allowed + violations)
+        allowed: List of allowed algorithms
+        violations: List of violation algorithms
+        max_width: Maximum table width
+    """
+    if not algorithms:
+        return
+    
+    if not TABULATE_AVAILABLE:
+        print(f"{Colors.YELLOW}Warning: tabulate not available, falling back to simple format{Colors.RESET}", file=sys.stderr)
+        # Fallback to simple format
+        print(f"\n{Colors.BOLD}{title}{Colors.RESET}")
+        for algo in sorted(set(algorithms)):
+            is_allowed = algo in allowed
+            is_violation = algo in violations
+            allowed_mark = f"{Colors.GREEN}✓{Colors.RESET}" if is_allowed else " "
+            violation_mark = f"{Colors.RED}✗{Colors.RESET}" if is_violation else " "
+            print(f"  {algo}: {allowed_mark} {violation_mark}")
+        print()
+        return
+    
+    # Sort all algorithms for consistent display
+    all_sorted = sorted(set(algorithms))
+    
+    # Prepare table data
+    table_data = []
+    for algo in all_sorted:
+        is_allowed = algo in allowed
+        is_violation = algo in violations
+        
+        allowed_mark = f"{Colors.GREEN}✓{Colors.RESET}" if is_allowed else " "
+        violation_mark = f"{Colors.RED}✗{Colors.RESET}" if is_violation else " "
+        
+        table_data.append([algo, allowed_mark, violation_mark])
+    
+    # Print title
+    print(f"\n{Colors.BOLD}{title}{Colors.RESET}")
+    
+    # Print table using tabulate with grid format
+    headers = ["Algorithm", "Allowed", "Not Allowed"]
+    print(tabulate(table_data, headers=headers, tablefmt="grid", stralign="left"))
+    print()
+
+
+def print_summary_table(results: Dict[str, Dict[str, Dict[str, Dict[str, List[str]]]]]):
+    """
+    Print summary table showing pass/fail status for each host:port
+    Columns: IP | Ciphers | KEX Algos | MAC Algos | Host Key Algos
+    """
+    if not results:
+        return
+    
+    # Collect summary data for each host:port
+    summary_data = []
+    
+    for host_port, host_results in sorted(results.items()):
+        ssh_results = host_results.get('ssh', {})
+        tls_results = host_results.get('tls', {})
+        
+        # Check Ciphers (SSH encryption + TLS combined)
+        ssh_cipher_violations = len(ssh_results.get('encryption', {}).get('violations', []))
+        tls_violations = 0
+        for tls_version in ['tls1_2', 'tls1_3']:
+            tls_violations += len(tls_results.get(tls_version, {}).get('violations', []))
+        ciphers_has_violations = (ssh_cipher_violations + tls_violations) > 0
+        
+        # Check KEX
+        kex_violations = len(ssh_results.get('kex', {}).get('violations', []))
+        kex_has_violations = kex_violations > 0
+        
+        # Check MAC
+        mac_violations = len(ssh_results.get('mac', {}).get('violations', []))
+        mac_has_violations = mac_violations > 0
+        
+        # Check Host Keys
+        host_key_violations = len(ssh_results.get('host_keys', {}).get('violations', []))
+        host_key_has_violations = host_key_violations > 0
+        
+        summary_data.append({
+            'ip': host_port,
+            'ciphers': ciphers_has_violations,
+            'kex': kex_has_violations,
+            'mac': mac_has_violations,
+            'host_keys': host_key_has_violations
+        })
+    
+    if not TABULATE_AVAILABLE:
+        print(f"{Colors.YELLOW}Warning: tabulate not available, falling back to simple format{Colors.RESET}", file=sys.stderr)
+        # Fallback to simple format
+        print(f"\n{Colors.BOLD}Summary Table{Colors.RESET}")
+        for item in summary_data:
+            ciphers_mark = f"{Colors.RED}✗{Colors.RESET}" if item['ciphers'] else f"{Colors.GREEN}✓{Colors.RESET}"
+            kex_mark = f"{Colors.RED}✗{Colors.RESET}" if item['kex'] else f"{Colors.GREEN}✓{Colors.RESET}"
+            mac_mark = f"{Colors.RED}✗{Colors.RESET}" if item['mac'] else f"{Colors.GREEN}✓{Colors.RESET}"
+            host_key_mark = f"{Colors.RED}✗{Colors.RESET}" if item['host_keys'] else f"{Colors.GREEN}✓{Colors.RESET}"
+            print(f"  {item['ip']}: Ciphers={ciphers_mark} KEX={kex_mark} MAC={mac_mark} HostKeys={host_key_mark}")
+        print()
+        return
+    
+    # Prepare table data for tabulate
+    table_data = []
+    for item in summary_data:
+        ciphers_mark = f"{Colors.RED}✗{Colors.RESET}" if item['ciphers'] else f"{Colors.GREEN}✓{Colors.RESET}"
+        kex_mark = f"{Colors.RED}✗{Colors.RESET}" if item['kex'] else f"{Colors.GREEN}✓{Colors.RESET}"
+        mac_mark = f"{Colors.RED}✗{Colors.RESET}" if item['mac'] else f"{Colors.GREEN}✓{Colors.RESET}"
+        host_key_mark = f"{Colors.RED}✗{Colors.RESET}" if item['host_keys'] else f"{Colors.GREEN}✓{Colors.RESET}"
+        
+        table_data.append([
+            item['ip'],
+            ciphers_mark,
+            kex_mark,
+            mac_mark,
+            host_key_mark
+        ])
+    
+    # Print summary table
+    print(f"\n{Colors.BOLD}{'═' * 80}{Colors.RESET}")
+    print(f"{Colors.BOLD}Summary Table{Colors.RESET}")
+    print(f"{Colors.BOLD}{'═' * 80}{Colors.RESET}\n")
+    
+    # Print table using tabulate with grid format
+    headers = ["IP", "Ciphers", "KEX Algos", "MAC Algos", "Host Key Algos"]
+    print(tabulate(table_data, headers=headers, tablefmt="grid", stralign="left"))
+    print()
+
+
 def print_results(results: Dict[str, Dict[str, Dict[str, Dict[str, List[str]]]]], ciphers_file: Optional[str]):
-    """Print validation results grouped by host:port"""
-    print(f"\n{Colors.CYAN}{Colors.BOLD}Algorithm Validation (ciphers.json = allowed list):{Colors.RESET}")
+    """Print validation results in concise table format"""
+    # Print logo
+    print_logo()
+    
     if ciphers_file:
-        print(f"Using ciphers.json: {ciphers_file}\n")
+        print(f"{Colors.CYAN}Using ciphers.json: {ciphers_file}{Colors.RESET}")
     else:
-        print(f"{Colors.YELLOW}Warning: ciphers.json not found - showing all algorithms as violations{Colors.RESET}\n")
+        print(f"{Colors.YELLOW}Warning: ciphers.json not found - showing all algorithms as violations{Colors.RESET}")
+    print()
     
     total_violations = 0
     total_hosts = len(results)
@@ -619,64 +803,66 @@ def print_results(results: Dict[str, Dict[str, Dict[str, Dict[str, List[str]]]]]
     for host_port, host_results in sorted(results.items()):
         host_violations = 0
         
-        print(f"{Colors.BOLD}{'='*70}{Colors.RESET}")
-        print(f"{Colors.BOLD}Host:Port: {Colors.CYAN}{host_port}{Colors.RESET}")
-        print(f"{Colors.BOLD}{'='*70}{Colors.RESET}\n")
+        print(f"{Colors.BOLD}{'═' * 80}{Colors.RESET}")
+        print(f"{Colors.BOLD}IP: {Colors.CYAN}{host_port}{Colors.RESET}")
+        print(f"{Colors.BOLD}{'═' * 80}{Colors.RESET}")
         
         # Process SSH results for this host:port
         ssh_results = host_results.get('ssh', {})
         if any(ssh_results.values()):
-            print(f"{Colors.BOLD}SSH Algorithms:{Colors.RESET}\n")
-            
-            for algo_type in ['kex', 'encryption', 'mac']:
-                type_name = algo_type.capitalize()
-                if algo_type == 'kex':
-                    type_name = 'KEX'
-                elif algo_type == 'encryption':
-                    type_name = 'Encryption Ciphers'
-                elif algo_type == 'mac':
-                    type_name = 'MAC Algorithms'
-                
-                violations = ssh_results.get(algo_type, {}).get('violations', [])
-                allowed = ssh_results.get(algo_type, {}).get('allowed', [])
-                
-                if violations:
+            # SSH Encryption Ciphers
+            if 'encryption' in ssh_results:
+                allowed = ssh_results['encryption'].get('allowed', [])
+                violations = ssh_results['encryption'].get('violations', [])
+                all_algos = allowed + violations
+                if all_algos:
                     host_violations += len(violations)
                     total_violations += len(violations)
-                    print(f"{Colors.RED}⚠ VIOLATIONS - {type_name} (NOT in allowed list):{Colors.RESET}")
-                    for algo in sorted(violations):
-                        print(f"    {Colors.RED}✗{Colors.RESET} {algo} {Colors.RED}(VIOLATION - not in allowed list){Colors.RESET}")
-                    print()
-                
-                if allowed:
-                    print(f"Allowed {type_name}:")
-                    for algo in sorted(allowed):
-                        print(f"    {Colors.GREEN}✓{Colors.RESET} {algo} (allowed)")
-                    print()
+                    print_table("SSH Encryption Ciphers", all_algos, allowed, violations)
+            
+            # SSH KEX
+            if 'kex' in ssh_results:
+                allowed = ssh_results['kex'].get('allowed', [])
+                violations = ssh_results['kex'].get('violations', [])
+                all_algos = allowed + violations
+                if all_algos:
+                    host_violations += len(violations)
+                    total_violations += len(violations)
+                    print_table("SSH KEX Algorithms", all_algos, allowed, violations)
+            
+            # SSH MAC
+            if 'mac' in ssh_results:
+                allowed = ssh_results['mac'].get('allowed', [])
+                violations = ssh_results['mac'].get('violations', [])
+                all_algos = allowed + violations
+                if all_algos:
+                    host_violations += len(violations)
+                    total_violations += len(violations)
+                    print_table("SSH MAC Algorithms", all_algos, allowed, violations)
+            
+            # SSH Host Keys
+            if 'host_keys' in ssh_results:
+                allowed = ssh_results['host_keys'].get('allowed', [])
+                violations = ssh_results['host_keys'].get('violations', [])
+                all_algos = allowed + violations
+                if all_algos:
+                    host_violations += len(violations)
+                    total_violations += len(violations)
+                    print_table("SSH Host Key Algorithms", all_algos, allowed, violations)
         
         # Process TLS results for this host:port
         tls_results = host_results.get('tls', {})
         if any(tls_results.values()):
-            print(f"{Colors.BOLD}TLS/SSL Ciphers:{Colors.RESET}\n")
-            
             for tls_version in ['tls1_2', 'tls1_3']:
                 version_name = f"TLS {tls_version.replace('tls', '').replace('_', '.')}"
                 violations = tls_results.get(tls_version, {}).get('violations', [])
                 allowed = tls_results.get(tls_version, {}).get('allowed', [])
+                all_ciphers = allowed + violations
                 
-                if violations:
+                if all_ciphers:
                     host_violations += len(violations)
                     total_violations += len(violations)
-                    print(f"{Colors.RED}⚠ VIOLATIONS - {version_name} Ciphers (NOT in allowed list):{Colors.RESET}")
-                    for cipher in sorted(violations):
-                        print(f"    {Colors.RED}✗{Colors.RESET} {cipher} {Colors.RED}(VIOLATION - not in allowed list){Colors.RESET}")
-                    print()
-                
-                if allowed:
-                    print(f"Allowed {version_name} Ciphers:")
-                    for cipher in sorted(allowed):
-                        print(f"    {Colors.GREEN}✓{Colors.RESET} {cipher} (allowed)")
-                    print()
+                    print_table(f"{version_name} Ciphers", all_ciphers, allowed, violations)
         
         # Summary for this host:port
         if host_violations > 0:
@@ -685,11 +871,14 @@ def print_results(results: Dict[str, Dict[str, Dict[str, Dict[str, List[str]]]]]
             print(f"{Colors.GREEN}✓ {host_port}: No violations - all algorithms are in allowed list{Colors.RESET}\n")
     
     # Overall summary
-    print(f"{Colors.BOLD}{'='*70}{Colors.RESET}")
+    print(f"{Colors.BOLD}{'═' * 80}{Colors.RESET}")
     if total_violations > 0:
         print(f"{Colors.RED}⚠ Overall Summary: {total_violations} violation(s) across {total_hosts} host(s){Colors.RESET}\n")
     else:
         print(f"{Colors.GREEN}✓ Overall Summary: No violations found across {total_hosts} host(s){Colors.RESET}\n")
+    
+    # Print summary table
+    print_summary_table(results)
 
 
 def main():
